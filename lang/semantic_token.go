@@ -17,9 +17,18 @@ type SemanticTokenType uint
 
 const (
 	TokenNil SemanticTokenType = iota
+
+	// structural tokens
 	TokenAttrName
 	TokenBlockType
 	TokenBlockLabel
+
+	// expressions
+	TokenBool
+	TokenString
+	TokenNumber
+	TokenObjectKey
+	TokenMapKey
 )
 
 func (t SemanticTokenType) GoString() string {

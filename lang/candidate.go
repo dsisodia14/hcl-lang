@@ -9,6 +9,7 @@ const (
 	AttributeCandidateKind
 	BlockCandidateKind
 	LabelCandidateKind
+	LiteralValueCandidateKind
 )
 
 type CandidateKind uint

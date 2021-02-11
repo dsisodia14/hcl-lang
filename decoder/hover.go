@@ -8,6 +8,7 @@ import (
 	"github.com/hashicorp/hcl-lang/schema"
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
+	"github.com/zclconf/go-cty/cty"
 )
 
 func (d *Decoder) HoverAtPos(filename string, pos hcl.Pos) (*lang.HoverData, error) {
@@ -47,17 +48,37 @@ func (d *Decoder) hoverAtPos(body *hclsyntax.Body, bodySchema *schema.BodySchema
 		if attr.Range().ContainsPos(pos) {
 			aSchema, ok := bodySchema.Attributes[attr.Name]
 			if !ok {
-				return nil, &PositionalError{
-					Filename: filename,
-					Pos:      pos,
-					Msg:      fmt.Sprintf("unknown attribute %q", attr.Name),
+				if bodySchema.AnyAttribute == nil {
+					return nil, &PositionalError{
+						Filename: filename,
+						Pos:      pos,
+						Msg:      fmt.Sprintf("unknown attribute %q", attr.Name),
+					}
 				}
+				aSchema = bodySchema.AnyAttribute
 			}
 
-			return &lang.HoverData{
-				Content: hoverContentForAttribute(name, aSchema),
-				Range:   attr.Range(),
-			}, nil
+			if attr.NameRange.ContainsPos(pos) {
+				return &lang.HoverData{
+					Content: hoverContentForAttribute(name, aSchema),
+					Range:   attr.Range(),
+				}, nil
+			}
+
+			if attr.Expr.Range().ContainsPos(pos) {
+				content, err := hoverContentForExpr(attr.Expr, aSchema.Expr)
+				if err != nil {
+					return nil, &PositionalError{
+						Filename: filename,
+						Pos:      pos,
+						Msg:      err.Error(),
+					}
+				}
+				return &lang.HoverData{
+					Content: content,
+					Range:   attr.Expr.Range(),
+				}, nil
+			}
 		}
 	}
 
@@ -119,7 +140,7 @@ func (d *Decoder) hoverAtPos(body *hclsyntax.Body, bodySchema *schema.BodySchema
 	return nil, &PositionalError{
 		Filename: filename,
 		Pos:      pos,
-		Msg:      "position outside of any attribute or block",
+		Msg:      "position outside of any attribute name, value or block",
 	}
 }
 
@@ -188,4 +209,155 @@ func hoverContentForBlock(bType string, schema *schema.BlockSchema) lang.MarkupC
 		Kind:  lang.MarkdownKind,
 		Value: value,
 	}
+}
+
+func hoverContentForExpr(expr hcl.Expression, constraints schema.ExprConstraints) (lang.MarkupContent, error) {
+	switch e := expr.(type) {
+	case *hclsyntax.TemplateExpr:
+		if len(e.Parts) == 1 {
+			return hoverContentForExpr(e.Parts[0], constraints)
+		}
+	case *hclsyntax.TemplateWrapExpr:
+		return hoverContentForExpr(e.Wrapped, constraints)
+	case *hclsyntax.TupleConsExpr:
+		listLve, ok := listTypeLiteralConstraint(constraints)
+		if ok {
+			return hoverContentForValueAndType(cty.NullVal(listLve.Type), listLve.Type)
+		}
+		setLve, ok := setTypeLiteralConstraint(constraints)
+		if ok {
+			return hoverContentForValueAndType(cty.NullVal(setLve.Type), setLve.Type)
+		}
+		tupleLve, ok := tupleTypeLiteralConstraint(constraints)
+		if ok {
+			return hoverContentForValueAndType(cty.NullVal(tupleLve.Type), tupleLve.Type)
+		}
+	case *hclsyntax.ObjectConsExpr:
+		objLve, ok := objectTypeLiteralConstraint(constraints)
+		if ok {
+			return hoverContentForValueAndType(cty.NullVal(objLve.Type), objLve.Type)
+		}
+		mapLve, ok := mapTypeLiteralConstraint(constraints)
+		if ok {
+			return hoverContentForValueAndType(cty.NullVal(mapLve.Type), mapLve.Type)
+		}
+	case *hclsyntax.LiteralValueExpr:
+		lve, ok := literalExprForType(e.Val.Type(), constraints)
+		if !ok {
+			// incompatible/unknown literal type
+			return lang.MarkupContent{}, fmt.Errorf("no schema for literal type %q",
+				e.Val.Type().FriendlyName())
+		}
+
+		return hoverContentForValueAndType(e.Val, lve.Type)
+	}
+
+	return lang.MarkupContent{}, fmt.Errorf("unsupported expression (%T)", expr)
+}
+
+func hoverContentForValueAndType(val cty.Value, t cty.Type) (lang.MarkupContent, error) {
+	if t.IsPrimitiveType() {
+		var value string
+		switch t {
+		case cty.String:
+			value = fmt.Sprintf("`%s`", val.AsString())
+		case cty.Bool:
+			value = fmt.Sprintf("`%t`", val.True())
+		case cty.Number:
+			value = fmt.Sprintf("`%s`", val.AsBigFloat().String())
+		}
+
+		value += fmt.Sprintf(` _%s_`, t.FriendlyName())
+
+		return lang.MarkupContent{
+			Kind:  lang.MarkdownKind,
+			Value: value,
+		}, nil
+	}
+
+	if t.IsObjectType() {
+		attrNames := sortedObjectAttrNames(t)
+		if len(attrNames) == 0 {
+			return lang.MarkupContent{
+				Kind:  lang.MarkdownKind,
+				Value: t.FriendlyName(),
+			}, nil
+		}
+		value := "```\n{\n"
+		for _, name := range attrNames {
+			valType := t.AttributeType(name)
+			value += fmt.Sprintf("  %s = %s\n", name,
+				valType.FriendlyName())
+		}
+		value += "}\n```\n_object_"
+
+		return lang.MarkupContent{
+			Kind:  lang.MarkdownKind,
+			Value: value,
+		}, nil
+	}
+
+	if t.IsMapType() || t.IsListType() || t.IsSetType() || t.IsTupleType() {
+		value := fmt.Sprintf(`_%s_`, t.FriendlyName())
+		return lang.MarkupContent{
+			Kind:  lang.MarkdownKind,
+			Value: value,
+		}, nil
+	}
+
+	return lang.MarkupContent{}, fmt.Errorf("unsupported type: %q", t.FriendlyName())
+}
+
+func listTypeLiteralConstraint(constraints schema.ExprConstraints) (schema.LiteralTypeExpr, bool) {
+	for _, c := range constraints {
+		if lve, ok := c.(schema.LiteralTypeExpr); ok && lve.Type.IsListType() {
+			return lve, true
+		}
+	}
+	return schema.LiteralTypeExpr{}, false
+}
+
+func setTypeLiteralConstraint(constraints schema.ExprConstraints) (schema.LiteralTypeExpr, bool) {
+	for _, c := range constraints {
+		if lve, ok := c.(schema.LiteralTypeExpr); ok && lve.Type.IsSetType() {
+			return lve, true
+		}
+	}
+	return schema.LiteralTypeExpr{}, false
+}
+
+func tupleTypeLiteralConstraint(constraints schema.ExprConstraints) (schema.LiteralTypeExpr, bool) {
+	for _, c := range constraints {
+		if lve, ok := c.(schema.LiteralTypeExpr); ok && lve.Type.IsTupleType() {
+			return lve, true
+		}
+	}
+	return schema.LiteralTypeExpr{}, false
+}
+
+func objectTypeLiteralConstraint(constraints schema.ExprConstraints) (schema.LiteralTypeExpr, bool) {
+	for _, c := range constraints {
+		if lve, ok := c.(schema.LiteralTypeExpr); ok && lve.Type.IsObjectType() {
+			return lve, true
+		}
+	}
+	return schema.LiteralTypeExpr{}, false
+}
+
+func mapTypeLiteralConstraint(constraints schema.ExprConstraints) (schema.LiteralTypeExpr, bool) {
+	for _, c := range constraints {
+		if lve, ok := c.(schema.LiteralTypeExpr); ok && lve.Type.IsMapType() {
+			return lve, true
+		}
+	}
+	return schema.LiteralTypeExpr{}, false
+}
+
+func literalExprForType(exprType cty.Type, constraints schema.ExprConstraints) (schema.LiteralTypeExpr, bool) {
+	for _, c := range constraints {
+		if lve, ok := c.(schema.LiteralTypeExpr); ok && lve.Type.Equals(exprType) {
+			return lve, true
+		}
+	}
+	return schema.LiteralTypeExpr{}, false
 }
